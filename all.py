@@ -13,26 +13,39 @@ OIBC irradiance 2-stage pipeline (kt target + pseudo kt-lag from predictions)
 구조:
   1) train/test 로드 + concat
   2) pv_id별 보간 (cubic/step/linear) + 메모리 downcast
-  3) 시간/태양/rowwise/dynamics 피처 생성
+  3) 시간/태양/rowwise/dynamics/날씨 lag·rolling 피처 생성
   4) Haurwitz clear-sky I_cs + per-PV alpha 보정 + train만 kt 생성
-  5) [1단계] exogenous 피처만으로 kt 예측 (GroupKFold OOF)
+  5) [Stage 1] exogenous 피처만으로 kt 예측 (GroupKFold OOF)
          → train: kt_hat_stage1(OOF), test: kt_hat_stage1(mean of folds)
   6) kt_hat_stage1 기준 lag/rolling 생성
-  7) [2단계]  kt_hat_stage1 + lag/rolling + 기타 피처로 kt 재학습
-         → 예측한 kt_hat_final * I_cs → nins
+  7) [Stage 2] kt_hat_stage1 + lag/rolling + 날씨 lag/rolling 등으로 kt 재학습
+         → GroupKFold CV + 앙상블 → kt_hat_final * I_cs → nins
   8) night=0, 음수컷 후 제출 파일 생성
+  9) (속도 개선) 전처리 완료 data_feat를 data_feat.parquet로 저장/재사용
 """
 
-import pandas as pd
-import numpy as np
+import os
+import gc
 import time as t
-import traceback, gc, random, logging, sys
+import random
+import logging
+import traceback
+import sys
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
 
 from lightgbm import LGBMRegressor
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold
+
+# Optuna (있으면 사용, 없으면 None)
+try:
+    import optuna
+except ImportError:
+    optuna = None
 
 # =========================
 # 0) Paths / Parameters
@@ -44,6 +57,10 @@ TEST_CSV  = BASE / "test.csv"
 
 SUBMISSION_PATH = BASE / "submission_two_stage.csv"
 LOG_PATH        = BASE / "pipeline_two_stage.log"
+FEATURE_PATH    = BASE / "data_feat.parquet"  # 전처리 완료 피처 저장용
+
+# 전처리 다시 만들지 여부 (True면 항상 새로 계산)
+REBUILD_FEATURES = False
 
 SEED = 42
 np.random.seed(SEED)
@@ -57,6 +74,13 @@ ROLL_MIN_PERIODS = 1
 
 # 학습 시 태양고도 컷
 ELEV_MIN = 9.0
+
+# Optuna 튜닝 설정 (기본 False)
+USE_OPTUNA_STAGE1 = False
+USE_OPTUNA_STAGE2 = False
+N_TRIALS_STAGE1   = 20
+N_TRIALS_STAGE2   = 20
+MAX_TUNE_ROWS     = 200_000   # 튜닝에 사용할 최대 행 수 (샘플링용)
 
 # =========================
 # Logging
@@ -73,9 +97,11 @@ ch.setFormatter(fmt)
 logger.addHandler(fh)
 logger.addHandler(ch)
 
+
 def log(msg: str):
     print(msg)
     logger.info(msg)
+
 
 # =========================
 # Utils
@@ -88,6 +114,7 @@ def downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
         df[c] = df[c].astype(np.int32)
     return df
 
+
 def load_data(path: Path) -> pd.DataFrame:
     t0 = t.time()
     df = pd.read_csv(path)
@@ -98,6 +125,7 @@ def load_data(path: Path) -> pd.DataFrame:
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     log(f"[Time] parsed in {t.time()-t1:.2f}s, time_na={df['time'].isna().sum()}")
     return df
+
 
 # =========================
 # 1) Imputation rules
@@ -111,11 +139,13 @@ cubic_cols = [
 step_ffill_cols = ["precip_1h","rain","snow"]
 exclude_from_interp = {"time","pv_id","type","energy","nins"}
 
+
 def _coerce_numeric(df, cols):
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
 
 def impute_by_rules(group_df: pd.DataFrame, pv_id: str) -> pd.DataFrame:
     log(f"\n▶ [Group] {pv_id} rows={len(group_df)}")
@@ -139,10 +169,12 @@ def impute_by_rules(group_df: pd.DataFrame, pv_id: str) -> pd.DataFrame:
                 method="polynomial", order=3, limit_direction="both"
             )
 
+    # step forward-fill
     if present_step:
         log(f"  - step_ffill: {present_step}")
         g.loc[:, present_step] = g.loc[:, present_step].ffill()
 
+    # other numeric → linear
     numeric_cols = g.select_dtypes(include=[np.number]).columns.tolist()
     other_linear_cols = [
         c for c in numeric_cols
@@ -160,6 +192,7 @@ def impute_by_rules(group_df: pd.DataFrame, pv_id: str) -> pd.DataFrame:
 
     log(f"  ✓ done: {pv_id}")
     return g
+
 
 def impute_all(df: pd.DataFrame) -> pd.DataFrame:
     if "pv_id" not in df.columns:
@@ -181,12 +214,14 @@ def impute_all(df: pd.DataFrame) -> pd.DataFrame:
         str(round(out.memory_usage(deep=True).sum()/1024**2, 1)) + " MB")
     return out
 
+
 # =========================
 # 2) Time & Solar features
 # =========================
 
 KOR_LAT = 36.5
 KOR_LON = 127.9
+
 
 def add_time_and_solar_features(df: pd.DataFrame, tz="Asia/Seoul") -> pd.DataFrame:
     g = df.copy()
@@ -202,13 +237,16 @@ def add_time_and_solar_features(df: pd.DataFrame, tz="Asia/Seoul") -> pd.DataFra
     g["minute"] = g["time"].dt.minute
     g["doy"] = g["time"].dt.dayofyear
 
+    # 일중 주기
     day_angle  = 2*np.pi*((g["hour"]*60 + g["minute"]) / (24*60))
     g["sin_time"] = np.sin(day_angle)
     g["cos_time"] = np.cos(day_angle)
+    # 연중 주기
     year_angle = 2*np.pi*(g["doy"] / 365.25)
     g["sin_doy"] = np.sin(year_angle)
     g["cos_doy"] = np.cos(year_angle)
 
+    # 태양 위치 근사 (SPA 간이)
     lat = np.deg2rad(KOR_LAT)
     lon_deg = KOR_LON
     local_minutes = (g["hour"]*60 + g["minute"]).astype(float)
@@ -233,6 +271,7 @@ def add_time_and_solar_features(df: pd.DataFrame, tz="Asia/Seoul") -> pd.DataFra
     g["hra"]  = ((tst/4.0) - 180.0).astype(np.float32)
     g["decl"] = np.rad2deg(decl).astype(np.float32)
     return g
+
 
 # =========================
 # 3) Row-wise features & dynamics
@@ -292,24 +331,45 @@ def add_rowwise_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         g["uv_norm"] = (g["uv_idx"] / (g["cosZ_pos"] + 1e-3)).astype(np.float32)
     return g
 
+
 def add_weather_dynamics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    날씨 변수의 diff + rolling + lag (GroupKFold용 time-series dynamics)
+    - vis, uv_idx, dewpoint_depr, pressure, ground_press, temp_a, rel_hum
+    - LAG_STEPS / ROLL_SPECS 재사용
+    """
     g = df.sort_values(["pv_id","time"]).copy()
+
     def _lag(col, L):
         return g.groupby("pv_id", sort=False)[col].shift(L)
 
-    for col in ["vis","uv_idx","dewpoint_depr","pressure","ground_press"]:
-        if col in g.columns:
-            g[f"{col}_diff1"] = g[col] - _lag(col, 1)
-            g[f"{col}_roll6_mean"]  = g.groupby("pv_id", sort=False)[col].shift(1)\
-                                        .rolling(6, min_periods=1).mean().reset_index(level=0, drop=True)
-            g[f"{col}_roll12_mean"] = g.groupby("pv_id", sort=False)[col].shift(1)\
-                                        .rolling(12, min_periods=1).mean().reset_index(level=0, drop=True)
+    weather_cols = ["vis", "uv_idx", "dewpoint_depr",
+                    "pressure", "ground_press", "temp_a", "rel_hum"]
 
+    for col in weather_cols:
+        if col not in g.columns:
+            continue
+        # diff
+        g[f"{col}_diff1"] = g[col] - _lag(col, 1)
+
+        # lag들
+        for L in LAG_STEPS:
+            g[f"{col}_lag{L}"] = _lag(col, L)
+
+        # rolling
+        base = g.groupby("pv_id", sort=False)[col].shift(1)
+        for win, agg in ROLL_SPECS:
+            rolled = base.groupby(g["pv_id"], sort=False)\
+                         .rolling(window=win, min_periods=1).agg(agg)
+            g[f"{col}_roll{win}_{agg}"] = rolled.reset_index(level=0, drop=True)
+
+    # 강수 onset/offset
     if "precip_flag" in g.columns:
         pf = g["precip_flag"]
-        g["precip_onset"]  = ((pf==1) & (_lag("precip_flag",1)==0)).astype(np.int8)
-        g["precip_offset"] = ((pf==0) & (_lag("precip_flag",1)==1)).astype(np.int8)
+        g["precip_onset"]  = ((pf == 1) & (_lag("precip_flag", 1) == 0)).astype(np.int8)
+        g["precip_offset"] = ((pf == 0) & (_lag("precip_flag", 1) == 1)).astype(np.int8)
     return g
+
 
 def add_lag_rolling(df: pd.DataFrame,
                     by="pv_id", time_col="time", target="kt_hat_stage1",
@@ -326,6 +386,7 @@ def add_lag_rolling(df: pd.DataFrame,
         g[f"{target}_roll{win}_{agg}"] = rolled.reset_index(level=0, drop=True)
     return g
 
+
 # =========================
 # 4) Clear-sky (Haurwitz)
 # =========================
@@ -341,13 +402,149 @@ def compute_clear_sky_haurwitz(df, elev_col="solar_elev_deg"):
         cs = tmp.astype(np.float32)
     return cs
 
+
 # =========================
-# 5) Main
+# 5) Feature selection helpers
 # =========================
 
-def main():
-    start_all = t.time()
-    log("===== Two-stage kt pipeline start =====")
+META_COLS = {"time", "pv_id", "type", "energy", "nins",
+             "kt", "is_train", "minute"}
+
+
+def get_stage1_features(df: pd.DataFrame):
+    """
+    Stage1: exogenous 변수만 사용 (kt/kt_hat/lag 제외)
+    """
+    numeric_cols = [
+        c for c in df.columns
+        if np.issubdtype(df[c].dtype, np.number)
+    ]
+    drop_cols = META_COLS | {"kt_hat_stage1"}
+    # kt_hat lag/rolling은 아직 생성되기 전이므로 보통 없음
+    features = [c for c in numeric_cols if c not in drop_cols]
+    log(f"[Stage1] defined_features ({len(features)}): "
+        f"{features[:12]}{' ...' if len(features) > 12 else ''}")
+    return features
+
+
+def get_stage2_features(df: pd.DataFrame):
+    """
+    Stage2: kt_hat_stage1 + lag/rolling + 날씨 dynamics 포함
+    (meta 컬럼만 제외)
+    """
+    numeric_cols = [
+        c for c in df.columns
+        if np.issubdtype(df[c].dtype, np.number)
+    ]
+    drop_cols = META_COLS  # kt_hat_stage1 및 lag/rolling은 포함
+    features = [c for c in numeric_cols if c not in drop_cols]
+    log(f"[Stage2] defined_features ({len(features)}): "
+        f"{features[:12]}{' ...' if len(features) > 12 else ''}")
+    return features
+
+
+# =========================
+# 6) Optuna hyperparameter tuning
+# =========================
+
+def tune_lgbm_with_optuna(
+    stage_name: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    base_params: dict,
+    n_trials: int = 20,
+    n_splits: int = 3
+):
+    """
+    GroupKFold 기반 Optuna 튜닝.
+    - base_params: n_estimators, objective, n_jobs, force_row_wise 등 고정 파라미터
+    - 튜닝 대상: learning_rate, num_leaves, min_data_in_leaf, subsample,
+               colsample_bytree, reg_lambda
+    """
+    if optuna is None:
+        log(f"[Optuna] optuna 미설치 → {stage_name} 튜닝 스킵")
+        return {}
+
+    unique_groups = np.unique(groups)
+    if len(unique_groups) < n_splits:
+        n_splits = len(unique_groups)
+    if n_splits < 2:
+        log(f"[Optuna] {stage_name}: groups 수가 적어 튜닝 스킵")
+        return {}
+
+    log(f"[Optuna] {stage_name} 튜닝 시작 (trials={n_trials}, splits={n_splits})")
+
+    # 데이터가 너무 크면 샘플링
+    if len(X) > MAX_TUNE_ROWS:
+        rng = np.random.RandomState(SEED)
+        idx = rng.choice(len(X), size=MAX_TUNE_ROWS, replace=False)
+        X_tune = X[idx]
+        y_tune = y[idx]
+        groups_tune = groups[idx]
+        log(f"[Optuna] {stage_name}: rows {len(X)} → {len(X_tune)} (sampling)")
+    else:
+        X_tune, y_tune, groups_tune = X, y, groups
+
+    def objective(trial: "optuna.trial.Trial"):
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 64, 256, step=32),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 400),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 5.0),
+        }
+        gkf = GroupKFold(n_splits=n_splits)
+        oof = np.zeros(len(X_tune), dtype=np.float32)
+
+        for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_tune, y_tune, groups_tune), 1):
+            X_tr, X_va = X_tune[tr_idx], X_tune[va_idx]
+            y_tr, y_va = y_tune[tr_idx], y_tune[va_idx]
+
+            model = LGBMRegressor(
+                **base_params,
+                **params,
+                random_state=SEED + fold
+            )
+            model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_va, y_va)],
+                eval_metric="l1",
+                callbacks=[
+                    lgb.early_stopping(stopping_rounds=200),
+                    lgb.log_evaluation(period=0),
+                ]
+            )
+            best_iter = getattr(model, "best_iteration_", None)
+            oof[va_idx] = model.predict(X_va, num_iteration=best_iter).astype(np.float32)
+
+        mae = mean_absolute_error(y_tune, oof)
+        return mae
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=n_trials)
+    log(f"[Optuna] {stage_name} best trial MAE={study.best_value:.6f}")
+    log(f"[Optuna] {stage_name} best params={study.best_params}")
+    return study.best_params
+
+
+# =========================
+# 7) Feature building (전처리 전체)
+# =========================
+
+def build_or_load_features() -> pd.DataFrame:
+    """
+    전처리 전체를 한 번만 수행하고 data_feat.parquet에 저장.
+    이후에는 바로 로딩해서 Stage1/2 모델만 반복.
+    """
+    if FEATURE_PATH.exists() and not REBUILD_FEATURES:
+        log(f"[Features] load from {FEATURE_PATH}")
+        data_feat = pd.read_parquet(FEATURE_PATH)
+        # time이 tz 정보와 함께 저장되어 있을 것이라 별도 처리 불필요
+        return data_feat
+
+    log("[Features] 전처리 시작 (새로 계산)")
 
     # A) Load train/test
     train = load_data(TRAIN_CSV)
@@ -360,7 +557,7 @@ def main():
     train["is_train"] = 1
     test["is_train"]  = 0
 
-    # 컬럼 align (없는 컬럼은 자동으로 NaN으로 채워짐)
+    # 컬럼 align
     all_cols = sorted(set(train.columns) | set(test.columns))
     train = train.reindex(columns=all_cols)
     test  = test.reindex(columns=all_cols)
@@ -380,7 +577,7 @@ def main():
     log("[Solar] 시간/태양 피처 추가 완료")
     log(f"[Solar] done in {t.time()-t0:.2f}s")
 
-    # D) Row-wise & Dynamics
+    # D) Row-wise & Weather dynamics (lag/rolling까지)
     data_feat = add_rowwise_engineered_features(data_feat)
     data_feat = add_weather_dynamics(data_feat)
 
@@ -412,7 +609,6 @@ def main():
         if mask.sum() < 50:
             cand = sub
         else:
-            # raw kt로 clear subset 잡기
             num = sub.loc[mask, "nins"].astype(float)
             den = (sub.loc[mask, "I_cs_raw"] + eps).astype(float)
             tmp_kt = (num / den).clip(0, 2.0)
@@ -447,31 +643,49 @@ def main():
         (data_feat.loc[mask_kt_train, "I_cs"] + eps)
     ).clip(0.0, 1.4).astype(np.float32)
 
-    # 메모리 줄이기
     data_feat = downcast_numeric(data_feat)
+    log("[Features] downcast 완료")
 
-    log("[Stage1] 준비 완료: exogenous + kt (train only)")
+    # 저장
+    try:
+        data_feat.to_parquet(FEATURE_PATH, index=False)
+        log(f"[Features] saved to {FEATURE_PATH}")
+    except Exception as e:
+        log(f"[Features] parquet 저장 실패: {e} (다음 실행에서 전처리부터 다시 수행)")
+
+    return data_feat
+
+
+# =========================
+# 8) Main (Stage1 + Stage2 + Predict)
+# =========================
+
+def main():
+    start_all = t.time()
+    log("===== Two-stage kt pipeline start =====")
+
+    # 전처리 (load or build)
+    data_feat = build_or_load_features()
 
     # =========================
     # Stage 1: kt (exogenous only)
     # =========================
 
-    # 1단계 학습용 데이터 (train 전체 중 kt가 있는 행)
+    is_train = data_feat["is_train"] == 1
     df_tr1 = data_feat[is_train & data_feat["kt"].notna()].copy()
     df_te1 = data_feat[~is_train].copy()
 
-    # 원래 index 저장 (나중에 kt_hat_stage1 할당용)
     df_tr1["orig_idx"] = df_tr1.index.values
     df_te1["orig_idx"] = df_te1.index.values
 
-    # 🔹 (1) 낮 + 태양고도 컷으로 행 수 줄이기
+    # 낮 + 태양고도 컷
     mask_day_elev = (df_tr1["is_day"] == 1) & (df_tr1["solar_elev_deg"] >= ELEV_MIN)
     before_rows = len(df_tr1)
     df_tr1 = df_tr1[mask_day_elev]
     log(f"[Stage1] day & elev cut: {before_rows} -> {len(df_tr1)} rows")
 
-    # 🔹 (2) 그래도 너무 많으면 샘플링 (메모리 보호용)
-    MAX_STAGE1_ROWS = 800_000  # 필요하면 500_000 정도로 더 낮춰도 됨
+    # 샘플링 (메모리 보호용)
+    MAX_STAGE1_ROWS = 800_000
     if len(df_tr1) > MAX_STAGE1_ROWS:
         log(f"[Stage1] too many rows ({len(df_tr1)}). "
             f"Random sampling to {MAX_STAGE1_ROWS} rows for Stage1.")
@@ -479,25 +693,15 @@ def main():
 
     df_tr1 = df_tr1.reset_index(drop=True)
 
-    # feature 선택: nins, kt, is_train, time, pv_id, type, energy, minute 등 제외
-    exclude_cols_1 = {
-        "time","pv_id","type","energy","nins","kt",
-        "is_train","minute"
-    }
-    feature_candidates_1 = [
-        c for c in df_tr1.columns
-        if c not in exclude_cols_1 and np.issubdtype(df_tr1[c].dtype, np.number)
-    ]
-
-    log(f"[Stage1] candidate features = {len(feature_candidates_1)} "
-        f"(e.g. {feature_candidates_1[:12]}{' ...' if len(feature_candidates_1)>12 else ''})")
+    # feature 정의
+    feature_candidates_1 = get_stage1_features(df_tr1)
 
     # numpy 변환
     X_tr1 = df_tr1[feature_candidates_1].to_numpy(dtype=np.float32, copy=False)
     y_tr1 = df_tr1["kt"].to_numpy(dtype=np.float32, copy=False)
     X_te1 = df_te1[feature_candidates_1].to_numpy(dtype=np.float32, copy=False)
 
-    # NaN row 제거 (안전용)
+    # NaN row 제거
     keep1 = np.isfinite(X_tr1).all(axis=1) & np.isfinite(y_tr1)
     if not keep1.all():
         log(f"[Stage1] drop {(~keep1).sum()} rows (NaN in features/kt)")
@@ -507,80 +711,92 @@ def main():
     else:
         df_tr1 = df_tr1.reset_index(drop=True)
 
+    groups1 = df_tr1["pv_id"].values
+    unique_pv1 = np.unique(groups1)
+    n_splits1 = 5 if len(unique_pv1) >= 5 else max(2, len(unique_pv1))
+    gkf1 = GroupKFold(n_splits=n_splits1)
 
-    # GroupKFold by pv_id
-    groups = df_tr1["pv_id"].values
-    unique_pv = np.unique(groups)
-    n_splits = 5 if len(unique_pv) >= 5 else max(2, len(unique_pv))
-    gkf = GroupKFold(n_splits=n_splits)
+    # Stage1 base 파라미터
+    base_params1 = dict(
+        objective="regression_l1",
+        n_estimators=4000,
+        n_jobs=1,
+        force_row_wise=True,
+    )
 
-    oof_pred = np.zeros(len(df_tr1), dtype=np.float32)
-    test_pred_accum = np.zeros(len(df_te1), dtype=np.float32)
+    # Optuna 튜닝 (옵션)
+    if USE_OPTUNA_STAGE1:
+        best_params1 = tune_lgbm_with_optuna(
+            stage_name="Stage1",
+            X=X_tr1,
+            y=y_tr1,
+            groups=groups1,
+            base_params=base_params1,
+            n_trials=N_TRIALS_STAGE1,
+            n_splits=min(3, n_splits1),
+        )
+    else:
+        best_params1 = {
+            "learning_rate": 0.03,
+            "num_leaves": 128,
+            "min_data_in_leaf": 200,
+            "subsample": 0.9,
+            "colsample_bytree": 0.8,
+            "reg_lambda": 1.0,
+        }
 
-    fold_models = []
-    log(f"[Stage1] GroupKFold splits={n_splits}, train_rows={len(df_tr1)}, test_rows={len(df_te1)}")
+    oof_pred1 = np.zeros(len(df_tr1), dtype=np.float32)
+    test_pred_accum1 = np.zeros(len(df_te1), dtype=np.float32)
 
-    for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_tr1, y_tr1, groups), 1):
+    log(f"[Stage1] GroupKFold splits={n_splits1}, train_rows={len(df_tr1)}, test_rows={len(df_te1)}")
+
+    for fold, (tr_idx, va_idx) in enumerate(gkf1.split(X_tr1, y_tr1, groups1), 1):
         log(f"\n[Stage1][Fold {fold}] train={len(tr_idx)}, valid={len(va_idx)}")
         X_tr_f, y_tr_f = X_tr1[tr_idx], y_tr1[tr_idx]
         X_va_f, y_va_f = X_tr1[va_idx], y_tr1[va_idx]
 
-        model1 = LGBMRegressor(
-            objective="regression_l1",
+        params = dict(
+            **base_params1,
+            **best_params1,
             random_state=SEED + fold,
-            n_estimators=4000,
-            learning_rate=0.03,
-            num_leaves=128,
-            min_data_in_leaf=200,
-            subsample=0.9, subsample_freq=1,
-            colsample_bytree=0.8,
-            reg_lambda=1.0,
-            # 🔽 여기 두 줄이 핵심
-            n_jobs=1,              # 멀티스레드 끄고 단일 스레드로 (안정성↑, 속도↓)
-            force_row_wise=True    # 메모리 접근 방식을 row-wise로 강제 (세그폴트 방지용)
         )
-        
+
+        model1 = LGBMRegressor(**params)
+
         model1.fit(
             X_tr_f, y_tr_f,
             eval_set=[(X_va_f, y_va_f)],
             eval_metric="l1",
             callbacks=[
                 lgb.early_stopping(stopping_rounds=300),
-                lgb.log_evaluation(period=200)
-            ]
+                lgb.log_evaluation(period=200),
+            ],
         )
 
         best_iter = getattr(model1, "best_iteration_", None)
-        oof_pred[va_idx] = model1.predict(X_va_f, num_iteration=best_iter).astype(np.float32)
+        oof_pred1[va_idx] = model1.predict(X_va_f, num_iteration=best_iter).astype(np.float32)
 
-        # test 예측 누적
         pred_te_f = model1.predict(X_te1, num_iteration=best_iter).astype(np.float32)
-        test_pred_accum += pred_te_f
-
-        fold_models.append(model1)
+        test_pred_accum1 += pred_te_f
 
     # OOF 성능(kt 기준)
-    mae_kt_stage1 = mean_absolute_error(y_tr1, oof_pred)
+    mae_kt_stage1 = mean_absolute_error(y_tr1, oof_pred1)
     log(f"\n[Stage1] OOF MAE on kt: {mae_kt_stage1:.6f}")
 
-    kt_hat_stage1_tr = oof_pred
-    kt_hat_stage1_te = test_pred_accum / n_splits
+    kt_hat_stage1_tr = oof_pred1
+    kt_hat_stage1_te = test_pred_accum1 / n_splits1
 
     # 원본 data_feat에 kt_hat_stage1 할당
     data_feat["kt_hat_stage1"] = np.nan
-
-    # train
     idx_tr = df_tr1["orig_idx"].values
     data_feat.loc[idx_tr, "kt_hat_stage1"] = kt_hat_stage1_tr
-
-    # test
     idx_te = df_te1["orig_idx"].values
     data_feat.loc[idx_te, "kt_hat_stage1"] = kt_hat_stage1_te
 
     log("[Stage1] kt_hat_stage1 assigned to all rows")
 
     # =========================
-    # Stage 2: kt using kt_hat_stage1 lag/rolling
+    # Stage 2: kt using kt_hat_stage1 lag/rolling + 날씨 lag/rolling
     # =========================
 
     log("\n[Stage2] kt_hat_stage1 lag/rolling 생성")
@@ -589,101 +805,124 @@ def main():
         by="pv_id", time_col="time", target="kt_hat_stage1",
         lag_steps=LAG_STEPS,
         roll_specs=ROLL_SPECS,
-        roll_min_periods=ROLL_MIN_PERIODS
+        roll_min_periods=ROLL_MIN_PERIODS,
     )
 
-    # 다시 정렬 (lag 함수에서 sort해서 copy가 됐기 때문에)
+    # 정렬
     data_feat = data_feat.sort_values(["pv_id","time"]).reset_index(drop=True)
 
-    # Stage2 학습용 마스크: train + 낮 + 태양고도 컷 + kt 존재
     is_train = data_feat["is_train"] == 1
+    is_test  = data_feat["is_train"] == 0
+
+    # Stage2 학습용 마스크: train + 낮 + 태양고도 컷 + kt 존재
     mask_tr2 = is_train & (data_feat["is_day"] == 1) & \
                (data_feat["solar_elev_deg"] >= ELEV_MIN) & \
                data_feat["kt"].notna()
 
     log(f"[Stage2] train rows after day/elev cut: {mask_tr2.sum()}")
 
-    # train/val PV 분리 (홀드아웃)
-    train_pvs = sorted(data_feat.loc[mask_tr2, "pv_id"].unique().tolist())
-    n_val_pv = max(1, int(len(train_pvs) * 0.12))
-    val_pvs = set(random.sample(train_pvs, n_val_pv))
+    df_tr2 = data_feat[mask_tr2].copy()
+    df_tr2["orig_idx"] = df_tr2.index.values
 
-    val_mask = mask_tr2 & data_feat["pv_id"].isin(val_pvs)
-    tr_mask = mask_tr2 & ~data_feat["pv_id"].isin(val_pvs)
+    # Stage2 피처 정의 (날씨 lag/rolling + kt_hat_stage1 lag/rolling 포함)
+    feature_candidates_2 = get_stage2_features(data_feat)
 
-    log(f"[Stage2] train_pvs={len(train_pvs)}, val_pvs={len(val_pvs)}")
-    log(f"[Stage2] rows: train={tr_mask.sum()}, valid={val_mask.sum()}")
-
-    # Stage2 feature 선택
-    exclude_cols_2 = {
-        "time","pv_id","type","energy",
-        "nins","kt","is_train","minute"
-    }
-    feature_candidates_2 = [
-        c for c in data_feat.columns
-        if c not in exclude_cols_2 and np.issubdtype(data_feat[c].dtype, np.number)
-    ]
-
-    log(f"[Stage2] candidate features = {len(feature_candidates_2)} "
-        f"(e.g. {feature_candidates_2[:12]}{' ...' if len(feature_candidates_2)>12 else ''})")
-
-    X_tr2 = data_feat.loc[tr_mask, feature_candidates_2].to_numpy(dtype=np.float32, copy=False)
-    y_tr2 = data_feat.loc[tr_mask, "kt"].to_numpy(dtype=np.float32, copy=False)
-    X_va2 = data_feat.loc[val_mask, feature_candidates_2].to_numpy(dtype=np.float32, copy=False)
-    y_va2 = data_feat.loc[val_mask, "kt"].to_numpy(dtype=np.float32, copy=False)
+    X2 = df_tr2[feature_candidates_2].to_numpy(dtype=np.float32, copy=False)
+    y2 = df_tr2["kt"].to_numpy(dtype=np.float32, copy=False)
+    groups2 = df_tr2["pv_id"].values
 
     # NaN 제거
-    keep_tr2 = np.isfinite(X_tr2).all(axis=1) & np.isfinite(y_tr2)
-    if not keep_tr2.all():
-        log(f"[Stage2] drop {(~keep_tr2).sum()} rows in train (NaN)")
-        X_tr2 = X_tr2[keep_tr2]
-        y_tr2 = y_tr2[keep_tr2]
+    keep2 = np.isfinite(X2).all(axis=1) & np.isfinite(y2)
+    if not keep2.all():
+        log(f"[Stage2] drop {(~keep2).sum()} rows in train (NaN)")
+        X2 = X2[keep2]
+        y2 = y2[keep2]
+        groups2 = groups2[keep2]
+        df_tr2 = df_tr2.loc[keep2].reset_index(drop=True)
+    else:
+        df_tr2 = df_tr2.reset_index(drop=True)
 
-    keep_va2 = np.isfinite(X_va2).all(axis=1) & np.isfinite(y_va2)
-    if not keep_va2.all():
-        log(f"[Stage2] drop {(~keep_va2).sum()} rows in valid (NaN)")
-        X_va2 = X_va2[keep_va2]
-        y_va2 = y_va2[keep_va2]
-        # val_mask도 맞춰줄 수 있지만, MAE 계산용 행만 줄여도 괜찮음
+    unique_pv2 = np.unique(groups2)
+    n_splits2 = 5 if len(unique_pv2) >= 5 else max(2, len(unique_pv2))
+    gkf2 = GroupKFold(n_splits=n_splits2)
 
-    log("[Stage2] LightGBM 학습 시작 (kt target)")
-    lgbm2 = LGBMRegressor(
+    # Stage2 base 파라미터
+    base_params2 = dict(
         objective="regression_l1",
-        random_state=SEED,
         n_estimators=5000,
-        learning_rate=0.03,
-        num_leaves=128,
-        min_data_in_leaf=200,
-        subsample=0.9, subsample_freq=1,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        n_jobs=1,              # 단일 스레드
-        force_row_wise=True    # row-wise 강제
+        n_jobs=1,
+        force_row_wise=True,
     )
 
-    lgbm2.fit(
-        X_tr2, y_tr2,
-        eval_set=[(X_va2, y_va2)],
-        eval_metric="l1",
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=400),
-            lgb.log_evaluation(period=200)
-        ]
-    )
+    # Optuna 튜닝 (옵션)
+    if USE_OPTUNA_STAGE2:
+        best_params2 = tune_lgbm_with_optuna(
+            stage_name="Stage2",
+            X=X2,
+            y=y2,
+            groups=groups2,
+            base_params=base_params2,
+            n_trials=N_TRIALS_STAGE2,
+            n_splits=min(3, n_splits2),
+        )
+    else:
+        best_params2 = {
+            "learning_rate": 0.03,
+            "num_leaves": 128,
+            "min_data_in_leaf": 200,
+            "subsample": 0.9,
+            "colsample_bytree": 0.8,
+            "reg_lambda": 1.0,
+        }
 
-    best_iter2 = getattr(lgbm2, "best_iteration_", None)
+    # test 쪽 피처
+    X_test2 = data_feat.loc[is_test, feature_candidates_2].to_numpy(dtype=np.float32, copy=False)
 
-    # 검증구간 성능 (nins 기준)
-    kt_hat_va = lgbm2.predict(X_va2, num_iteration=best_iter2).astype(np.float32)
-    I_cs_va = data_feat.loc[val_mask, "I_cs"].values[:len(kt_hat_va)].astype(np.float32)
-    nins_va_true = data_feat.loc[val_mask, "nins"].values[:len(kt_hat_va)].astype(np.float32)
-    nins_va_pred = (kt_hat_va * I_cs_va).astype(np.float32)
-    is_day_va = data_feat.loc[val_mask, "is_day"].values[:len(kt_hat_va)]
-    nins_va_pred[is_day_va == 0] = 0.0
-    nins_va_pred = np.where(nins_va_pred < 0, 0, nins_va_pred)
+    oof_pred2 = np.zeros(len(df_tr2), dtype=np.float32)
+    test_pred_accum2 = np.zeros(len(X_test2), dtype=np.float32)
 
-    mae_val_nins = mean_absolute_error(nins_va_true, nins_va_pred)
-    log(f"[Stage2] Validation MAE on nins (day/elev cut): {mae_val_nins:.6f}")
+    log(f"[Stage2] GroupKFold splits={n_splits2}, train_rows={len(df_tr2)}, test_rows={X_test2.shape[0]}")
+
+    for fold, (tr_idx, va_idx) in enumerate(gkf2.split(X2, y2, groups2), 1):
+        log(f"\n[Stage2][Fold {fold}] train={len(tr_idx)}, valid={len(va_idx)}")
+        X_tr_f, y_tr_f = X2[tr_idx], y2[tr_idx]
+        X_va_f, y_va_f = X2[va_idx], y2[va_idx]
+
+        params2 = dict(
+            **base_params2,
+            **best_params2,
+            random_state=SEED + 100 + fold,
+        )
+
+        model2 = LGBMRegressor(**params2)
+
+        model2.fit(
+            X_tr_f, y_tr_f,
+            eval_set=[(X_va_f, y_va_f)],
+            eval_metric="l1",
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=400),
+                lgb.log_evaluation(period=200),
+            ],
+        )
+
+        best_iter2 = getattr(model2, "best_iteration_", None)
+        oof_pred2[va_idx] = model2.predict(X_va_f, num_iteration=best_iter2).astype(np.float32)
+
+        pred_te_f2 = model2.predict(X_test2, num_iteration=best_iter2).astype(np.float32)
+        test_pred_accum2 += pred_te_f2
+
+    # Stage2 OOF 성능 (nins 기준)
+    I_cs_tr2 = df_tr2["I_cs"].to_numpy(dtype=np.float32, copy=False)
+    nins_true_tr2 = df_tr2["nins"].to_numpy(dtype=np.float32, copy=False)
+    is_day_tr2 = df_tr2["is_day"].to_numpy(copy=False)
+
+    nins_pred_oof = (oof_pred2 * I_cs_tr2).astype(np.float32)
+    nins_pred_oof[is_day_tr2 == 0] = 0.0
+    nins_pred_oof = np.where(nins_pred_oof < 0, 0, nins_pred_oof)
+
+    mae_val_nins = mean_absolute_error(nins_true_tr2, nins_pred_oof)
+    log(f"[Stage2] OOF MAE on nins (GroupKFold): {mae_val_nins:.6f}")
 
     # =========================
     # 최종 test 예측 & 제출 파일 생성
@@ -691,9 +930,7 @@ def main():
 
     log("\n[Predict] on official test.csv")
 
-    is_test = data_feat["is_train"] == 0
-    X_test2 = data_feat.loc[is_test, feature_candidates_2].to_numpy(dtype=np.float32, copy=False)
-    kt_hat_test_final = lgbm2.predict(X_test2, num_iteration=best_iter2).astype(np.float32)
+    kt_hat_test_final = (test_pred_accum2 / n_splits2).astype(np.float32)
 
     I_cs_test = data_feat.loc[is_test, "I_cs"].to_numpy(dtype=np.float32, copy=False)
     is_day_test = data_feat.loc[is_test, "is_day"].to_numpy(copy=False)
